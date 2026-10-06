@@ -49,7 +49,7 @@ class ReportBuilder:
     def _format_table(frame: pd.DataFrame, columns: list[str], empty_text: str = "暂无数据") -> str:
         if frame.empty:
             return f"{empty_text}\n"
-        subset = frame[columns].copy()
+        subset = frame[columns].copy().where(pd.notna(frame[columns]), "-")
         return subset.to_markdown(index=False) + "\n"
 
     def build_markdown(self, trade_date: str) -> str:
@@ -106,6 +106,7 @@ class ReportBuilder:
         emotion_delta = None
         if emotion_row is not None and isinstance(emotion_row, pd.Series) and not prev_emotion.empty:
             emotion_delta = round(float(emotion_row["emotion_score"]) - float(prev_row["emotion_score"]), 2)
+        enabled_ranking = ranking[ranking["recommended_status"] == "启用"].copy() if not ranking.empty else pd.DataFrame()
 
         lines: list[str] = []
         lines.append(f"# A股短线战法复盘报告 - {trade_date}")
@@ -153,8 +154,21 @@ class ReportBuilder:
         lines.append(
             self._format_table(
                 ranking,
-                ["strategy_name", "sample_count", "cumulative_win_rate", "profit_loss_ratio", "rolling_30d_win_rate"],
-                empty_text="暂无数据（历史 T+1 验证样本不足，累计胜率与盈亏比暂不可计算）",
+                [
+                    "strategy_name",
+                    "recommended_status",
+                    "sample_level",
+                    "sample_count",
+                    "bayesian_win_rate",
+                    "cumulative_win_rate",
+                    "recent_10_win_rate",
+                    "recent_30_win_rate",
+                    "best_cycle_label",
+                    "best_cycle_bayesian_win_rate",
+                    "profit_loss_ratio",
+                    "recommendation_reason",
+                ],
+                empty_text="暂无数据（历史 T+1 验证样本不足，暂时无法形成稳定战法诊断）",
             )
         )
         lines.append("## 5. 次日战法选择与标的优先级")
@@ -173,10 +187,14 @@ class ReportBuilder:
         lines.append("- 14:00-15:00：记录候选股分时表现，收盘后更新验证与报告。")
         lines.append("## 7. 核心结论")
         top_pick = picks.iloc[0] if not picks.empty else {}
+        top_strategy = enabled_ranking.iloc[0] if not enabled_ranking.empty else (ranking.iloc[0] if not ranking.empty else {})
         lines.append(f"- 情绪阶段为 {emotion_row.get('cycle_label', '未知')}，仓位上限遵守单只≤30%、总仓≤80%。")
         lines.append("- 所有标的仅由规则引擎产生，禁止临盘情绪化加仓或切换战法。")
         lines.append("- 高位接力统一执行 +4% 止盈；若交易失败则无条件止损。")
         lines.append(f"- 当前优先级最高标的：{top_pick.get('code', '暂无')} {top_pick.get('name', '')}。")
+        lines.append(
+            f"- 当前优先战法：{top_strategy.get('strategy_name', '暂无')}；建议状态：{top_strategy.get('recommended_status', '观察')}；最佳周期：{top_strategy.get('best_cycle_label', '未知')}。"
+        )
         lines.append("- 仅当历史样本的贝叶斯修正胜率达到 80% 目标时，系统才输出最终推荐；否则维持观望。")
         lines.append("- 报告基于 SQLite 中累计样本自动生成，历史轨迹只追加不覆盖。")
         return "\n".join(lines).strip() + "\n"
