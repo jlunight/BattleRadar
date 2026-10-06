@@ -5,4 +5,5 @@ __all__ = [
     "strategy",
     "backtest",
     "reporter",
+    "historical_runner",
 ]

@@ -301,7 +301,11 @@ class MarketDataFetcher:
         end_date = end_date or date.today().strftime("%Y%m%d")
         inserted = 0
         for idx, row in universe.iterrows():
-            history = self.fetch_daily_history(row["code"], start_date=start_date, end_date=end_date)
+            try:
+                history = self.fetch_daily_history(row["code"], start_date=start_date, end_date=end_date)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("跳过单票日线抓取失败 code=%s error=%s", row["code"], exc)
+                continue
             if history.empty:
                 continue
             history["name"] = row["name"]
@@ -310,8 +314,9 @@ class MarketDataFetcher:
                 history,
                 unique_columns=["trade_date", "code"],
             )
-            if (idx + 1) % 100 == 0:
-                logger.info("日线更新进度: %s/%s", idx + 1, len(universe))
+            position = universe.index.get_loc(idx) + 1
+            if position % 100 == 0:
+                logger.info("日线更新进度: %s/%s", position, len(universe))
         logger.info("日线更新完成: %s 条", inserted)
         return inserted
 

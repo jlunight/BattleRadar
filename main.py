@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from dataclasses import asdict
 from datetime import date
 
 from battle_radar.backtest import BacktestEngine
 from battle_radar.config import DEFAULT_CONFIG
 from battle_radar.data_fetcher import MarketDataFetcher, configure_logging
+from battle_radar.historical_runner import HistoricalBackfillRunner
 from battle_radar.reporter import ReportBuilder
 from battle_radar.strategy import StrategyEngine
 
@@ -56,6 +58,16 @@ def run_report_layer(args: argparse.Namespace) -> dict:
     return {"report_path": str(report_path)}
 
 
+def run_history_layer(args: argparse.Namespace) -> dict:
+    runner = HistoricalBackfillRunner(config=DEFAULT_CONFIG)
+    summary = runner.run(
+        start_date=args.start_date,
+        end_date=args.trade_date,
+        max_symbols=args.max_symbols,
+    )
+    return asdict(summary)
+
+
 def run_all(args: argparse.Namespace) -> dict:
     data_result = run_data_layer(args)
     strategy_result = run_strategy_layer(args)
@@ -73,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="BattleRadar A股短线战法量化分析与回测系统")
     parser.add_argument(
         "--phase",
-        choices=["data", "strategy", "backtest", "report", "all"],
+        choices=["data", "strategy", "backtest", "report", "history", "all"],
         default="all",
         help="执行阶段",
     )
@@ -94,6 +106,7 @@ def main() -> None:
         "strategy": run_strategy_layer,
         "backtest": run_backtest_layer,
         "report": run_report_layer,
+        "history": run_history_layer,
         "all": run_all,
     }[args.phase]
     result = runner(args)

@@ -266,9 +266,12 @@ class StrategyEngine:
         return merged
 
     def _tag_board_leader(self, frame: pd.DataFrame) -> pd.DataFrame:
-        if frame.empty:
-            return frame
         frame = frame.copy()
+        if frame.empty:
+            frame["rank_in_industry"] = pd.Series(dtype=float)
+            frame["amount_rank_in_industry"] = pd.Series(dtype=float)
+            frame["is_board_leader"] = pd.Series(dtype=bool)
+            return frame
         frame["rank_in_industry"] = frame.groupby("industry")["limit_up_count"].rank(method="dense", ascending=False)
         frame["amount_rank_in_industry"] = frame.groupby("industry")["amount"].rank(method="dense", ascending=False)
         frame["is_board_leader"] = (frame["rank_in_industry"] == 1) & (frame["amount_rank_in_industry"] <= 2)
@@ -324,6 +327,10 @@ class StrategyEngine:
         trade_date = normalize_trade_date(trade_date) or trade_date
         buy_mode = self.config.buy_rule.default_buy_mode
         signals = frame.copy()
+        if "latest_price" not in signals.columns:
+            signals["latest_price"] = signals.get("close")
+        if "open" not in signals.columns:
+            signals["open"] = signals.get("latest_price")
         signals["trade_date"] = trade_date
         signals["strategy_name"] = strategy_name
         signals["buy_mode"] = buy_mode
