@@ -265,7 +265,7 @@ class StrategyEngine:
     def _normalize(series: pd.Series, reverse: bool = False) -> pd.Series:
         numeric = pd.to_numeric(series, errors="coerce").fillna(0)
         if numeric.nunique() <= 1:
-            return pd.Series([0.5] * len(numeric), index=numeric.index)
+            return pd.Series([1.0] * len(numeric), index=numeric.index)
         scaled = (numeric - numeric.min()) / (numeric.max() - numeric.min())
         return 1 - scaled if reverse else scaled
 
@@ -287,11 +287,9 @@ class StrategyEngine:
             + streak_height * 10
             + theme_space * 10
         ).round(2)
-        scored["tier"] = pd.cut(
-            scored["score"],
-            bins=[-1, 60, 70, 80, 101],
-            labels=["淘汰", "第三梯队", "第二梯队", "第一梯队"],
-        ).astype(str)
+        scored["tier"] = scored["score"].map(
+            lambda x: "第一梯队" if x >= 80 else ("第二梯队" if x >= 70 else ("第三梯队" if x >= 60 else "淘汰"))
+        )
         return scored[scored["score"] >= 60].sort_values("score", ascending=False)
 
     def _build_signal_rows(self, trade_date: str, strategy_name: str, frame: pd.DataFrame, cycle_label: str) -> pd.DataFrame:

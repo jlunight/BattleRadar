@@ -187,10 +187,13 @@ class SQLiteStore:
         return connection
 
     def _initialize_schema(self) -> None:
-        with self.connect() as conn:
+        conn = self.connect()
+        try:
             for statement in DDL_STATEMENTS:
                 conn.execute(statement)
             conn.commit()
+        finally:
+            conn.close()
 
     def upsert_dataframe(
         self,
@@ -210,9 +213,12 @@ class SQLiteStore:
             f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholders}) "
             f"ON CONFLICT ({', '.join(unique_columns)}) DO UPDATE SET {update_sql}"
         )
-        with self.connect() as conn:
+        conn = self.connect()
+        try:
             conn.executemany(sql, rows.where(pd.notna(rows), None).values.tolist())
             conn.commit()
+        finally:
+            conn.close()
         return len(rows)
 
     def query(self, sql: str, params: tuple | None = None) -> pd.DataFrame:

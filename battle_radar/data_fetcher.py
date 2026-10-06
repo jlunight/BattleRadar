@@ -71,6 +71,7 @@ class MarketDataFetcher:
     def _fetch_paginated_clist(self, url: str, base_params: dict[str, Any]) -> pd.DataFrame:
         frames: list[pd.DataFrame] = []
         page = 1
+        page_size = int(base_params.get("pz", 100))
         while True:
             params = dict(base_params)
             params["pn"] = str(page)
@@ -81,37 +82,60 @@ class MarketDataFetcher:
                     logger.warning("分页抓取中断，保留已成功页: url=%s page=%s", url, page)
                     break
                 raise
-            records = ((payload.get("data") or {}).get("diff")) or []
+            data = payload.get("data") or {}
+            records = data.get("diff") or []
             if not records:
                 break
             frames.append(pd.DataFrame(records))
-            if len(records) < int(base_params.get("pz", 100)):
+            total = data.get("total")
+            if len(records) < page_size:
+                break
+            if total is not None and page * page_size >= int(total):
                 break
             page += 1
         return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
     def get_stock_universe(self) -> pd.DataFrame:
-        url = "https://push2.eastmoney.com/api/qt/clist/get"
-        params = {
-            "pz": "100",
-            "po": "1",
-            "np": "1",
-            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-            "fltt": "2",
-            "invt": "2",
-            "fid": "f12",
-            "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:0+t:81+s:2048",
-            "fields": "f12,f14,f13",
-        }
-        df = self._fetch_paginated_clist(url, params)
-        if df.empty:
+        try:
+            url = "https://push2.eastmoney.com/api/qt/clist/get"
+            common_params = {
+                "pz": "5000",
+                "po": "1",
+                "np": "1",
+                "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                "fltt": "2",
+                "invt": "2",
+                "fid": "f12",
+                "fields": "f12,f14,f13",
+            }
+            sh_df = self._fetch_paginated_clist(url, common_params | {"fs": "m:1+t:2,m:1+t:23"})
+            sz_df = self._fetch_paginated_clist(url, common_params | {"fs": "m:0+t:6,m:0+t:80"})
+            df = pd.concat([sh_df, sz_df], ignore_index=True)
+            if not df.empty:
+                df = df.rename(columns={"f12": "code", "f14": "name", "f13": "exchange_flag"})
+                df["code"] = df["code"].astype(str).str.zfill(6)
+                df = df[df["code"].map(self.is_main_board_code)].copy()
+                df["exchange"] = df["code"].map(lambda code: "SH" if code.startswith("60") else "SZ")
+                df["board"] = "main"
+                return df[["code", "name", "exchange", "board"]].drop_duplicates().sort_values("code")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("东方财富股票池不可用，切换腾讯行情列表: %s", exc)
+
+        try:
+            tx_df = ak.stock_zh_a_spot_tx()
+            if tx_df.empty:
+                return pd.DataFrame(columns=["code", "name", "exchange", "board"])
+            tx_df = tx_df.rename(columns={"name": "name"})
+            tx_df["raw_code"] = tx_df["code"].astype(str)
+            tx_df["code"] = tx_df["raw_code"].str.extract(r"(\d{6})", expand=False)
+            tx_df = tx_df[tx_df["code"].notna()].copy()
+            tx_df = tx_df[tx_df["code"].map(self.is_main_board_code)].copy()
+            tx_df["exchange"] = tx_df["raw_code"].map(lambda x: "SH" if str(x).startswith("sh") else "SZ")
+            tx_df["board"] = "main"
+            return tx_df[["code", "name", "exchange", "board"]].drop_duplicates().sort_values("code")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("腾讯行情股票池也不可用: %s", exc)
             return pd.DataFrame(columns=["code", "name", "exchange", "board"])
-        df = df.rename(columns={"f12": "code", "f14": "name", "f13": "exchange_flag"})
-        df["code"] = df["code"].astype(str).str.zfill(6)
-        df = df[df["code"].map(self.is_main_board_code)].copy()
-        df["exchange"] = df["code"].map(lambda code: "SH" if code.startswith("60") else "SZ")
-        df["board"] = "main"
-        return df[["code", "name", "exchange", "board"]].drop_duplicates().sort_values("code")
 
     def update_stock_universe(self) -> pd.DataFrame:
         universe = self.get_stock_universe()
@@ -171,7 +195,53 @@ class MarketDataFetcher:
                 last_error = exc
                 logger.warning("日线抓取失败，第 %s 次重试 symbol=%s error=%s", attempt, symbol, exc)
                 time.sleep(min(attempt, 3))
-        raise RuntimeError(f"抓取日线失败 symbol={symbol} error={last_error}") from last_error
+
+        market_symbol = f"sh{symbol}" if symbol.startswith("60") else f"sz{symbol}"
+        try:
+            tx_df = ak.stock_zh_a_hist_tx(
+                symbol=market_symbol,
+                start_date=f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}",
+                end_date=f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}",
+                adjust="qfq",
+            )
+            if tx_df.empty:
+                return pd.DataFrame()
+            tx_df = tx_df.rename(
+                columns={
+                    "date": "trade_date",
+                    "open": "open",
+                    "close": "close",
+                    "high": "high",
+                    "low": "low",
+                    "volume": "volume",
+                    "turnover": "turnover",
+                    "amount": "amount",
+                }
+            )
+            tx_df["code"] = symbol
+            tx_df["amplitude"] = None
+            tx_df["pct_chg"] = ((tx_df["close"] - tx_df["close"].shift(1)) / tx_df["close"].shift(1) * 100).round(2)
+            tx_df["chg"] = (tx_df["close"] - tx_df["close"].shift(1)).round(2)
+            tx_df["pct_chg"] = tx_df["pct_chg"].fillna(0)
+            tx_df["chg"] = tx_df["chg"].fillna(0)
+            return tx_df[
+                [
+                    "trade_date",
+                    "code",
+                    "open",
+                    "close",
+                    "high",
+                    "low",
+                    "volume",
+                    "amount",
+                    "turnover",
+                    "amplitude",
+                    "pct_chg",
+                    "chg",
+                ]
+            ]
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"抓取日线失败 symbol={symbol} error={exc}") from exc
 
     def update_daily_prices(
         self,
@@ -373,7 +443,7 @@ class MarketDataFetcher:
             fs = "m:90 t:2 f:!50"
         url = "https://push2.eastmoney.com/api/qt/clist/get"
         params = {
-            "pz": "100",
+            "pz": "500",
             "po": "1",
             "np": "1",
             "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -492,7 +562,28 @@ class MarketDataFetcher:
     def update_market_snapshot(self, trade_date: str) -> dict[str, int]:
         limit_up = self.fetch_limit_up_pool(trade_date)
         limit_down = self.fetch_limit_down_pool(trade_date)
-        board_snapshot = self.fetch_board_snapshot(trade_date)
+        try:
+            board_snapshot = self.fetch_board_snapshot(trade_date)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("板块快照抓取失败 trade_date=%s error=%s", trade_date, exc)
+            board_snapshot = pd.DataFrame(
+                columns=[
+                    "trade_date",
+                    "board_type",
+                    "board_code",
+                    "board_name",
+                    "latest_price",
+                    "pct_chg",
+                    "chg",
+                    "total_market_cap",
+                    "turnover",
+                    "up_count",
+                    "down_count",
+                    "leader_stock",
+                    "leader_pct_chg",
+                    "limit_up_count",
+                ]
+            )
         counts = {
             "limit_up": self.store.upsert_dataframe(
                 "limit_up_pool", limit_up, unique_columns=["trade_date", "code"]
@@ -527,10 +618,13 @@ class MarketDataFetcher:
            ), 0)
          WHERE trade_date = ?
         """
-        with self.store.connect() as conn:
+        conn = self.store.connect()
+        try:
             cursor = conn.execute(sql, (trade_date, trade_date))
             conn.commit()
             return cursor.rowcount
+        finally:
+            conn.close()
 
     def compute_market_metrics(self, trade_date: str) -> pd.DataFrame:
         price_stats = self.store.query(
@@ -607,4 +701,4 @@ if __name__ == "__main__":
         max_symbols=int(os.getenv("MAX_SYMBOLS", "20")),
         update_board_members=os.getenv("UPDATE_BOARD_MEMBERS", "1") == "1",
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

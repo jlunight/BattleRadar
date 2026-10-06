@@ -93,7 +93,7 @@ def main() -> None:
         "all": run_all,
     }[args.phase]
     result = runner(args)
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 
 
 if __name__ == "__main__":
