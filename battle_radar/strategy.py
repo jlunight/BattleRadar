@@ -9,6 +9,7 @@ import pandas as pd
 
 from battle_radar.config import AppConfig, DEFAULT_CONFIG
 from battle_radar.database import SQLiteStore
+from battle_radar.utils import normalize_trade_date
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ class StrategyEngine:
         return df["trade_date"].tolist() if not df.empty else []
 
     def _previous_trade_date(self, trade_date: str) -> str | None:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         calendar = self._trade_calendar()
         if trade_date not in calendar:
             earlier = [d for d in calendar if d < trade_date]
@@ -32,12 +34,31 @@ class StrategyEngine:
         return calendar[idx - 1] if idx > 0 else None
 
     def _load_trade_frame(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         sql = """
-        WITH board_strength AS (
+        WITH board_snapshot_strength AS (
             SELECT board_name, MAX(limit_up_count) AS board_limit_up_count, MAX(pct_chg) AS board_pct_chg
             FROM board_snapshot
             WHERE trade_date = ?
             GROUP BY board_name
+        ),
+        board_limitup_strength AS (
+            SELECT industry AS board_name,
+                   COUNT(*) AS board_limit_up_count,
+                   AVG(pct_chg) AS board_pct_chg
+            FROM limit_up_pool
+            WHERE trade_date = ?
+              AND industry IS NOT NULL
+            GROUP BY industry
+        ),
+        board_strength AS (
+            SELECT
+                bl.board_name AS board_name,
+                COALESCE(bs.board_limit_up_count, bl.board_limit_up_count, 0) AS board_limit_up_count,
+                COALESCE(bs.board_pct_chg, bl.board_pct_chg, 0) AS board_pct_chg
+            FROM board_limitup_strength bl
+            LEFT JOIN board_snapshot_strength bs
+              ON bs.board_name = bl.board_name
         )
         SELECT
             lup.trade_date,
@@ -71,7 +92,7 @@ class StrategyEngine:
           ON board_strength.board_name = lup.industry
         WHERE lup.trade_date = ?
         """
-        frame = self.store.query(sql, (trade_date, trade_date))
+        frame = self.store.query(sql, (trade_date, trade_date, trade_date))
         if frame.empty:
             return frame
         numeric_cols = [
@@ -97,6 +118,7 @@ class StrategyEngine:
         return frame
 
     def compute_emotion_cycle(self, trade_date: str) -> dict:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         history = self.store.query("SELECT * FROM market_metrics ORDER BY trade_date")
         if history.empty:
             detail = {"reason": "缺少 market_metrics 数据"}
@@ -172,6 +194,7 @@ class StrategyEngine:
         return detail
 
     def _load_stock_character(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         begin_date = (datetime.strptime(trade_date, "%Y%m%d") - timedelta(days=240)).strftime("%Y%m%d")
         sql = """
         SELECT code,
@@ -185,6 +208,7 @@ class StrategyEngine:
         return self.store.query(sql, (begin_date, trade_date))
 
     def _load_recent_returns(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         prev_7 = self.store.query(
             """
             WITH ranked AS (
@@ -208,6 +232,7 @@ class StrategyEngine:
         return prev_7[["code", "return_7d"]]
 
     def _load_ma_signals(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         sql = """
         WITH ranked AS (
             SELECT trade_date, code, close, volume, low,
@@ -228,6 +253,7 @@ class StrategyEngine:
         return self.store.query(sql, (trade_date,))
 
     def _attach_features(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         base = self._load_trade_frame(trade_date)
         if base.empty:
             return base
@@ -295,6 +321,7 @@ class StrategyEngine:
     def _build_signal_rows(self, trade_date: str, strategy_name: str, frame: pd.DataFrame, cycle_label: str) -> pd.DataFrame:
         if frame.empty:
             return pd.DataFrame()
+        trade_date = normalize_trade_date(trade_date) or trade_date
         buy_mode = self.config.buy_rule.default_buy_mode
         signals = frame.copy()
         signals["trade_date"] = trade_date
@@ -344,6 +371,7 @@ class StrategyEngine:
         ]
 
     def high_relay(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         frame = self._tag_board_leader(self._attach_features(trade_date))
         frame = frame[
             (frame["limit_up_count"].between(3, 6))
@@ -357,6 +385,7 @@ class StrategyEngine:
         return self._score_candidates(self._apply_hard_filters(frame, "高位接力"))
 
     def two_to_three(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         frame = self._tag_board_leader(self._attach_features(trade_date))
         frame = frame[
             (frame["limit_up_count"] == 2)
@@ -369,6 +398,7 @@ class StrategyEngine:
         return self._score_candidates(self._apply_hard_filters(frame, "2进3"))
 
     def rebound_after_break(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         prev_date = self._previous_trade_date(trade_date)
         if not prev_date:
             return pd.DataFrame()
@@ -413,6 +443,7 @@ class StrategyEngine:
         return self._score_candidates(merged)
 
     def pullback_dip(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         ma_frame = self._load_ma_signals(trade_date)
         price_frame = self.store.query(
             """
@@ -446,6 +477,7 @@ class StrategyEngine:
         return self._score_candidates(merged)
 
     def three_to_four(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         frame = self._tag_board_leader(self._attach_features(trade_date))
         frame = frame[
             (frame["limit_up_count"] == 3)
@@ -457,6 +489,7 @@ class StrategyEngine:
         return self._score_candidates(self._apply_hard_filters(frame, "3进4"))
 
     def breakout_limit(self, trade_date: str, cycle_label: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         frame = self._tag_board_leader(self._attach_features(trade_date))
         frame = frame[(frame["limit_up_count"] >= 2) & (frame["is_board_leader"])]
         if cycle_label != "高潮":
@@ -464,6 +497,7 @@ class StrategyEngine:
         return self._score_candidates(self._apply_hard_filters(frame, "打板"))
 
     def run_all_strategies(self, trade_date: str) -> dict[str, pd.DataFrame]:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         emotion = self.compute_emotion_cycle(trade_date)
         cycle_label = emotion["cycle_label"]
         strategy_map = {

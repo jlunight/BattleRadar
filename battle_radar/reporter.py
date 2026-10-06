@@ -8,6 +8,7 @@ import pandas as pd
 from battle_radar.backtest import BacktestEngine
 from battle_radar.config import AppConfig, DEFAULT_CONFIG
 from battle_radar.database import SQLiteStore
+from battle_radar.utils import normalize_trade_date
 
 
 class ReportBuilder:
@@ -17,6 +18,7 @@ class ReportBuilder:
         self.backtest = BacktestEngine(config=self.config, store=self.store)
 
     def _previous_trade_date(self, trade_date: str) -> str | None:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         dates = self.store.query("SELECT DISTINCT trade_date FROM daily_prices ORDER BY trade_date")["trade_date"].tolist()
         if trade_date not in dates:
             earlier = [d for d in dates if d < trade_date]
@@ -24,18 +26,42 @@ class ReportBuilder:
         idx = dates.index(trade_date)
         return dates[idx - 1] if idx > 0 else None
 
+    def _resolve_trade_date(self, trade_date: str) -> str:
+        trade_date = normalize_trade_date(trade_date) or trade_date
+        union_dates = self.store.query(
+            """
+            SELECT trade_date FROM daily_prices
+            UNION
+            SELECT trade_date FROM limit_up_pool
+            UNION
+            SELECT trade_date FROM market_metrics
+            ORDER BY trade_date
+            """
+        )["trade_date"].tolist()
+        if not union_dates:
+            return trade_date
+        if trade_date in union_dates:
+            return trade_date
+        earlier = [d for d in union_dates if d <= trade_date]
+        return earlier[-1] if earlier else union_dates[-1]
+
     @staticmethod
-    def _format_table(frame: pd.DataFrame, columns: list[str]) -> str:
+    def _format_table(frame: pd.DataFrame, columns: list[str], empty_text: str = "暂无数据") -> str:
         if frame.empty:
-            return "暂无数据\n"
+            return f"{empty_text}\n"
         subset = frame[columns].copy()
         return subset.to_markdown(index=False) + "\n"
 
     def build_markdown(self, trade_date: str) -> str:
+        trade_date = self._resolve_trade_date(trade_date)
         prev_date = self._previous_trade_date(trade_date)
         emotion = self.store.query("SELECT * FROM emotion_scores WHERE trade_date = ?", (trade_date,))
         prev_emotion = self.store.query("SELECT * FROM emotion_scores WHERE trade_date = ?", (prev_date,)) if prev_date else pd.DataFrame()
         metrics = self.store.query("SELECT * FROM market_metrics WHERE trade_date = ?", (trade_date,))
+        coverage = self.store.query(
+            "SELECT COUNT(DISTINCT code) AS stock_count FROM daily_prices WHERE trade_date = ?",
+            (trade_date,),
+        )
         ladder = self.store.query(
             """
             SELECT code, name, limit_up_count, turnover, industry, limit_up_reason
@@ -76,6 +102,7 @@ class ReportBuilder:
         emotion_row = emotion.iloc[0] if not emotion.empty else {}
         prev_row = prev_emotion.iloc[0] if not prev_emotion.empty else {}
         metrics_row = metrics.iloc[0] if not metrics.empty else {}
+        coverage_row = coverage.iloc[0] if not coverage.empty else {}
         emotion_delta = None
         if emotion_row is not None and isinstance(emotion_row, pd.Series) and not prev_emotion.empty:
             emotion_delta = round(float(emotion_row["emotion_score"]) - float(prev_row["emotion_score"]), 2)
@@ -89,6 +116,9 @@ class ReportBuilder:
         )
         lines.append(
             f"- 涨停数：{metrics_row.get('limit_up_count', 'N/A')}；跌停数：{metrics_row.get('limit_down_count', 'N/A')}；上涨家数：{metrics_row.get('up_count', 'N/A')}；下跌家数：{metrics_row.get('down_count', 'N/A')}；两市成交额：{metrics_row.get('total_amount', 'N/A')}"
+        )
+        lines.append(
+            f"- 当前已落库日线覆盖：{coverage_row.get('stock_count', 0)} 只；若验证区为空，通常表示 T+1 行情尚未形成或相关标的后续日线尚未补齐。"
         )
         lines.append("")
         lines.append("## 2. 连板梯队")
@@ -104,12 +134,19 @@ class ReportBuilder:
                 )
             )
         lines.append("### 断板股")
-        lines.append(self._format_table(broken, ["code", "name", "pct_chg", "turnover"]))
+        lines.append(
+            self._format_table(
+                broken,
+                ["code", "name", "pct_chg", "turnover"],
+                empty_text="暂无数据（无符合条件的断板股，或前一交易日样本不足）",
+            )
+        )
         lines.append("## 3. 昨日战法实战验证")
         lines.append(
             self._format_table(
                 validation,
                 ["strategy_name", "code", "name", "buy_price", "next_high", "max_return_pct", "success", "sample_tag"],
+                empty_text="暂无数据（上一信号日尚未形成 T+1 验证，或后续交易日行情尚未落库）",
             )
         )
         lines.append("## 4. 战法胜率总排名")
@@ -117,6 +154,7 @@ class ReportBuilder:
             self._format_table(
                 ranking,
                 ["strategy_name", "sample_count", "cumulative_win_rate", "profit_loss_ratio", "rolling_30d_win_rate"],
+                empty_text="暂无数据（历史 T+1 验证样本不足，累计胜率与盈亏比暂不可计算）",
             )
         )
         lines.append("## 5. 次日战法选择与标的优先级")
@@ -124,6 +162,7 @@ class ReportBuilder:
             self._format_table(
                 picks,
                 ["strategy_name", "tier", "code", "name", "score", "buy_price", "stop_loss", "max_position", "reason"],
+                empty_text="暂无数据（当前交易日无满足量化规则的候选股）",
             )
         )
         lines.append("## 6. 操作时间表")

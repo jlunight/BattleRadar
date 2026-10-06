@@ -47,6 +47,10 @@ def run_backtest_layer(args: argparse.Namespace) -> dict:
 
 
 def run_report_layer(args: argparse.Namespace) -> dict:
+    strategy_engine = StrategyEngine(config=DEFAULT_CONFIG)
+    strategy_engine.run_all_strategies(args.trade_date)
+    backtest_engine = BacktestEngine(config=DEFAULT_CONFIG)
+    backtest_engine.backtest_signals()
     builder = ReportBuilder(config=DEFAULT_CONFIG)
     report_path = builder.write_report(args.trade_date)
     return {"report_path": str(report_path)}

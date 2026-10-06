@@ -15,6 +15,7 @@ import requests
 
 from battle_radar.config import AppConfig, DEFAULT_CONFIG
 from battle_radar.database import SQLiteStore
+from battle_radar.utils import normalize_trade_date, normalize_trade_date_series
 
 
 logger = logging.getLogger(__name__)
@@ -144,7 +145,85 @@ class MarketDataFetcher:
         logger.info("股票池更新完成: %s", len(universe))
         return universe
 
+    def normalize_stored_trade_dates(self) -> None:
+        table_columns = {
+            "daily_prices": ["trade_date"],
+            "limit_up_pool": ["trade_date"],
+            "limit_down_pool": ["trade_date"],
+            "board_snapshot": ["trade_date"],
+            "market_metrics": ["trade_date"],
+            "emotion_scores": ["trade_date"],
+            "strategy_signals": ["trade_date"],
+            "backtest_results": ["signal_date", "next_trade_date"],
+        }
+        conn = self.store.connect()
+        try:
+            for table_name, columns in table_columns.items():
+                frame = self.store.query(f"SELECT rowid, {', '.join(columns)} FROM {table_name}")
+                if frame.empty:
+                    continue
+                updates: list[tuple[str, int]] = []
+                for column in columns:
+                    normalized = normalize_trade_date_series(frame[column])
+                    for rowid, old_value, new_value in zip(frame["rowid"], frame[column], normalized):
+                        if new_value and str(old_value) != new_value:
+                            updates.append((column, new_value, int(rowid)))
+                for column, new_value, rowid in updates:
+                    conn.execute(f"UPDATE {table_name} SET {column} = ? WHERE rowid = ?", (new_value, rowid))
+            conn.commit()
+        finally:
+            conn.close()
+
     def fetch_daily_history(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        start_date = normalize_trade_date(start_date) or start_date
+        end_date = normalize_trade_date(end_date) or end_date
+        market_symbol = f"sh{symbol}" if symbol.startswith("60") else f"sz{symbol}"
+        try:
+            tx_df = ak.stock_zh_a_hist_tx(
+                symbol=market_symbol,
+                start_date=f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}",
+                end_date=f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}",
+                adjust="qfq",
+            )
+            if not tx_df.empty:
+                tx_df = tx_df.rename(
+                    columns={
+                        "date": "trade_date",
+                        "open": "open",
+                        "close": "close",
+                        "high": "high",
+                        "low": "low",
+                        "volume": "volume",
+                        "turnover": "turnover",
+                        "amount": "amount",
+                    }
+                )
+                tx_df["code"] = symbol
+                tx_df["trade_date"] = normalize_trade_date_series(tx_df["trade_date"])
+                tx_df["amplitude"] = None
+                tx_df["pct_chg"] = ((tx_df["close"] - tx_df["close"].shift(1)) / tx_df["close"].shift(1) * 100).round(2)
+                tx_df["chg"] = (tx_df["close"] - tx_df["close"].shift(1)).round(2)
+                tx_df["pct_chg"] = tx_df["pct_chg"].fillna(0)
+                tx_df["chg"] = tx_df["chg"].fillna(0)
+                return tx_df[
+                    [
+                        "trade_date",
+                        "code",
+                        "open",
+                        "close",
+                        "high",
+                        "low",
+                        "volume",
+                        "amount",
+                        "turnover",
+                        "amplitude",
+                        "pct_chg",
+                        "chg",
+                    ]
+                ]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("腾讯日线抓取失败，回退东方财富 symbol=%s error=%s", symbol, exc)
+
         last_error: Exception | None = None
         for attempt in range(1, self.config.request_retries + 1):
             try:
@@ -175,6 +254,7 @@ class MarketDataFetcher:
                     }
                 )
                 renamed["code"] = renamed["code"].astype(str).str.zfill(6)
+                renamed["trade_date"] = normalize_trade_date_series(renamed["trade_date"])
                 return renamed[
                     [
                         "trade_date",
@@ -195,62 +275,27 @@ class MarketDataFetcher:
                 last_error = exc
                 logger.warning("日线抓取失败，第 %s 次重试 symbol=%s error=%s", attempt, symbol, exc)
                 time.sleep(min(attempt, 3))
-
-        market_symbol = f"sh{symbol}" if symbol.startswith("60") else f"sz{symbol}"
-        try:
-            tx_df = ak.stock_zh_a_hist_tx(
-                symbol=market_symbol,
-                start_date=f"{start_date[:4]}-{start_date[4:6]}-{start_date[6:8]}",
-                end_date=f"{end_date[:4]}-{end_date[4:6]}-{end_date[6:8]}",
-                adjust="qfq",
-            )
-            if tx_df.empty:
-                return pd.DataFrame()
-            tx_df = tx_df.rename(
-                columns={
-                    "date": "trade_date",
-                    "open": "open",
-                    "close": "close",
-                    "high": "high",
-                    "low": "low",
-                    "volume": "volume",
-                    "turnover": "turnover",
-                    "amount": "amount",
-                }
-            )
-            tx_df["code"] = symbol
-            tx_df["amplitude"] = None
-            tx_df["pct_chg"] = ((tx_df["close"] - tx_df["close"].shift(1)) / tx_df["close"].shift(1) * 100).round(2)
-            tx_df["chg"] = (tx_df["close"] - tx_df["close"].shift(1)).round(2)
-            tx_df["pct_chg"] = tx_df["pct_chg"].fillna(0)
-            tx_df["chg"] = tx_df["chg"].fillna(0)
-            return tx_df[
-                [
-                    "trade_date",
-                    "code",
-                    "open",
-                    "close",
-                    "high",
-                    "low",
-                    "volume",
-                    "amount",
-                    "turnover",
-                    "amplitude",
-                    "pct_chg",
-                    "chg",
-                ]
-            ]
-        except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"抓取日线失败 symbol={symbol} error={exc}") from exc
+        raise RuntimeError(f"抓取日线失败 symbol={symbol} error={last_error}") from last_error
 
     def update_daily_prices(
         self,
         start_date: str | None = None,
         end_date: str | None = None,
         max_symbols: int | None = None,
+        universe_df: pd.DataFrame | None = None,
+        priority_codes: list[str] | None = None,
     ) -> int:
-        universe = self.update_stock_universe()
-        if max_symbols:
+        universe = universe_df.copy() if universe_df is not None else self.update_stock_universe()
+        priority_codes = priority_codes or []
+        if priority_codes:
+            priority_df = universe[universe["code"].isin(priority_codes)].copy()
+            remaining_df = universe[~universe["code"].isin(priority_codes)].copy()
+            if max_symbols:
+                remaining_quota = max(max_symbols - len(priority_df), 0)
+                universe = pd.concat([priority_df, remaining_df.head(remaining_quota)], ignore_index=True)
+            else:
+                universe = pd.concat([priority_df, remaining_df], ignore_index=True)
+        elif max_symbols:
             universe = universe.head(max_symbols).copy()
         start_date = start_date or self.config.backfill_start_date
         end_date = end_date or date.today().strftime("%Y%m%d")
@@ -319,6 +364,7 @@ class MarketDataFetcher:
         ]
 
     def fetch_limit_up_pool(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         try:
             raw = ak.stock_zt_pool_em(date=trade_date)
             if not raw.empty:
@@ -389,6 +435,7 @@ class MarketDataFetcher:
         return pd.DataFrame(rows)
 
     def fetch_limit_down_pool(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         url = "https://push2ex.eastmoney.com/getTopicDTPool"
         payload = self._request_json(
             url,
@@ -430,6 +477,7 @@ class MarketDataFetcher:
         return pd.DataFrame(rows)
 
     def fetch_lhb(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         df = ak.stock_lhb_detail_em(start_date=trade_date, end_date=trade_date)
         if df.empty:
             return df
@@ -490,6 +538,7 @@ class MarketDataFetcher:
         ]
 
     def fetch_board_snapshot(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         concept = self._fetch_board_list("concept")
         industry = self._fetch_board_list("industry")
         snapshot = pd.concat([concept, industry], ignore_index=True)
@@ -560,6 +609,7 @@ class MarketDataFetcher:
         return updated
 
     def update_market_snapshot(self, trade_date: str) -> dict[str, int]:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         limit_up = self.fetch_limit_up_pool(trade_date)
         limit_down = self.fetch_limit_down_pool(trade_date)
         try:
@@ -600,6 +650,7 @@ class MarketDataFetcher:
         return counts
 
     def recompute_board_limit_up_count(self, trade_date: str) -> int:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         sql = """
         WITH counts AS (
             SELECT bm.board_type, bm.board_code, COUNT(DISTINCT lup.code) AS limit_up_count
@@ -627,6 +678,7 @@ class MarketDataFetcher:
             conn.close()
 
     def compute_market_metrics(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         price_stats = self.store.query(
             """
             SELECT
@@ -666,6 +718,17 @@ class MarketDataFetcher:
                 "source",
             ]
         ]
+        for col in [
+            "up_count",
+            "down_count",
+            "flat_count",
+            "limit_up_count",
+            "limit_down_count",
+            "total_amount",
+            "board_height",
+            "streak_stock_count",
+        ]:
+            merged[col] = pd.to_numeric(merged[col], errors="coerce").fillna(0)
         self.store.upsert_dataframe("market_metrics", merged, unique_columns=["trade_date"])
         return merged
 
@@ -676,9 +739,28 @@ class MarketDataFetcher:
         max_symbols: int | None = None,
         update_board_members: bool = True,
     ) -> dict[str, Any]:
-        trade_date = trade_date or date.today().strftime("%Y%m%d")
-        inserted_prices = self.update_daily_prices(start_date=start_date, end_date=trade_date, max_symbols=max_symbols)
+        self.normalize_stored_trade_dates()
+        trade_date = normalize_trade_date(trade_date or date.today().strftime("%Y%m%d")) or date.today().strftime("%Y%m%d")
+        universe = self.update_stock_universe()
         snapshot_counts = self.update_market_snapshot(trade_date)
+        priority_pool = self.store.query(
+            """
+            SELECT DISTINCT code
+            FROM (
+                SELECT code FROM limit_up_pool WHERE trade_date = ?
+                UNION
+                SELECT code FROM limit_down_pool WHERE trade_date = ?
+            )
+            """,
+            (trade_date, trade_date),
+        )
+        inserted_prices = self.update_daily_prices(
+            start_date=start_date,
+            end_date=trade_date,
+            max_symbols=max_symbols,
+            universe_df=universe,
+            priority_codes=priority_pool["code"].tolist() if not priority_pool.empty else [],
+        )
         board_members = self.update_board_members() if update_board_members else 0
         self.recompute_board_limit_up_count(trade_date)
         metrics = self.compute_market_metrics(trade_date)

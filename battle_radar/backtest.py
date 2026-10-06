@@ -8,6 +8,7 @@ import pandas as pd
 
 from battle_radar.config import AppConfig, DEFAULT_CONFIG
 from battle_radar.database import SQLiteStore
+from battle_radar.utils import normalize_trade_date
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,7 @@ class BacktestEngine:
         return df["trade_date"].tolist() if not df.empty else []
 
     def _next_trade_date(self, trade_date: str) -> str | None:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         calendar = self._trade_calendar()
         if trade_date not in calendar:
             later = [d for d in calendar if d > trade_date]
@@ -31,6 +33,7 @@ class BacktestEngine:
         return calendar[idx + 1] if idx + 1 < len(calendar) else None
 
     def backtest_signals(self, signal_date: str | None = None) -> pd.DataFrame:
+        signal_date = normalize_trade_date(signal_date) if signal_date else None
         if signal_date:
             signals = self.store.query("SELECT * FROM strategy_signals WHERE trade_date = ?", (signal_date,))
         else:
@@ -141,6 +144,7 @@ class BacktestEngine:
         return self.store.query(sql)
 
     def latest_validation(self, trade_date: str) -> pd.DataFrame:
+        trade_date = normalize_trade_date(trade_date) or trade_date
         sql = """
         SELECT *
         FROM backtest_results
