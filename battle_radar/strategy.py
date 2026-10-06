@@ -321,6 +321,152 @@ class StrategyEngine:
         )
         return scored[scored["score"] >= 60].sort_values("score", ascending=False)
 
+    @staticmethod
+    def _score_band(score: float) -> str:
+        if pd.isna(score):
+            return "unknown"
+        if score >= 90:
+            return "90+"
+        if score >= 85:
+            return "85-89"
+        if score >= 80:
+            return "80-84"
+        if score >= 70:
+            return "70-79"
+        return "<70"
+
+    def _history_snapshot(self, strategy_name: str, cycle_label: str, score: float, trade_date: str) -> dict[str, float | int | str]:
+        history = self.store.query(
+            """
+            SELECT
+                b.success,
+                s.cycle_label,
+                s.score
+            FROM backtest_results b
+            JOIN strategy_signals s
+              ON s.trade_date = b.signal_date
+             AND s.strategy_name = b.strategy_name
+             AND s.code = b.code
+            WHERE b.strategy_name = ?
+              AND b.signal_date < ?
+            """,
+            (strategy_name, trade_date),
+        )
+        if history.empty:
+            return {
+                "target_win_rate_pct": self.config.strategy_quality.target_win_rate_pct,
+                "overall_samples": 0,
+                "overall_win_rate_pct": 0.0,
+                "overall_posterior_pct": 0.0,
+                "cycle_samples": 0,
+                "cycle_win_rate_pct": 0.0,
+                "cycle_posterior_pct": 0.0,
+                "band_samples": 0,
+                "band_win_rate_pct": 0.0,
+                "band_posterior_pct": 0.0,
+                "score_band": self._score_band(score),
+                "pass_quality_gate": False,
+                "gate_reason": "cold_start",
+            }
+
+        quality = self.config.strategy_quality
+        history["score_band"] = history["score"].map(self._score_band)
+        score_band = self._score_band(score)
+
+        def summarize(frame: pd.DataFrame) -> tuple[int, float, float]:
+            if frame.empty:
+                return 0, 0.0, 0.0
+            samples = int(len(frame))
+            success_count = float(frame["success"].sum())
+            win_rate = round(success_count / samples * 100, 2)
+            posterior = round(
+                (success_count + quality.prior_success)
+                / (samples + quality.prior_success + quality.prior_failure)
+                * 100,
+                2,
+            )
+            return samples, win_rate, posterior
+
+        overall_samples, overall_win_rate, overall_posterior = summarize(history)
+        cycle_history = history[history["cycle_label"] == cycle_label]
+        cycle_samples, cycle_win_rate, cycle_posterior = summarize(cycle_history)
+        band_history = cycle_history[cycle_history["score_band"] == score_band]
+        band_samples, band_win_rate, band_posterior = summarize(band_history)
+
+        passed = False
+        gate_reason = "below_target"
+        if band_samples >= quality.min_band_samples and band_posterior >= quality.target_win_rate_pct:
+            passed = True
+            gate_reason = "band_pass"
+        elif (
+            cycle_samples >= quality.min_cycle_samples
+            and cycle_posterior >= quality.target_win_rate_pct
+            and float(score) >= 85
+        ):
+            passed = True
+            gate_reason = "cycle_pass"
+        elif (
+            overall_samples >= quality.min_strategy_samples
+            and overall_posterior >= quality.target_win_rate_pct
+            and float(score) >= quality.min_score_for_fallback
+        ):
+            passed = True
+            gate_reason = "strategy_pass"
+
+        return {
+            "target_win_rate_pct": quality.target_win_rate_pct,
+            "overall_samples": overall_samples,
+            "overall_win_rate_pct": overall_win_rate,
+            "overall_posterior_pct": overall_posterior,
+            "cycle_samples": cycle_samples,
+            "cycle_win_rate_pct": cycle_win_rate,
+            "cycle_posterior_pct": cycle_posterior,
+            "band_samples": band_samples,
+            "band_win_rate_pct": band_win_rate,
+            "band_posterior_pct": band_posterior,
+            "score_band": score_band,
+            "pass_quality_gate": passed,
+            "gate_reason": gate_reason,
+        }
+
+    def _apply_quality_gate(self, trade_date: str, strategy_name: str, cycle_label: str, frame: pd.DataFrame) -> pd.DataFrame:
+        if frame.empty:
+            return frame
+        trade_date = normalize_trade_date(trade_date) or trade_date
+        gated = frame.copy()
+        history_count = self.store.query(
+            "SELECT COUNT(*) AS cnt FROM backtest_results WHERE strategy_name = ? AND signal_date < ?",
+            (strategy_name, trade_date),
+        )["cnt"].iloc[0]
+        # 冷启动阶段保留原始信号，避免样本尚未积累时系统失声。
+        if int(history_count) == 0:
+            gated["target_win_rate_pct"] = self.config.strategy_quality.target_win_rate_pct
+            gated["overall_samples"] = 0
+            gated["overall_win_rate_pct"] = None
+            gated["overall_posterior_pct"] = None
+            gated["cycle_samples"] = 0
+            gated["cycle_win_rate_pct"] = None
+            gated["cycle_posterior_pct"] = None
+            gated["band_samples"] = 0
+            gated["band_win_rate_pct"] = None
+            gated["band_posterior_pct"] = None
+            gated["score_band"] = gated["score"].map(self._score_band)
+            gated["pass_quality_gate"] = self.config.strategy_quality.allow_cold_start
+            gated["gate_reason"] = "cold_start"
+            return gated[gated["pass_quality_gate"]].copy()
+
+        snapshots = gated["score"].map(lambda score: self._history_snapshot(strategy_name, cycle_label, float(score), trade_date))
+        snapshot_df = pd.DataFrame(list(snapshots))
+        gated = pd.concat([gated.reset_index(drop=True), snapshot_df.reset_index(drop=True)], axis=1)
+        gated = gated[gated["pass_quality_gate"]].copy()
+        if gated.empty:
+            return gated
+        gated = gated.sort_values(
+            ["band_posterior_pct", "cycle_posterior_pct", "overall_posterior_pct", "score"],
+            ascending=False,
+        )
+        return gated.head(self.config.strategy_quality.max_signals_per_strategy)
+
     def _build_signal_rows(self, trade_date: str, strategy_name: str, frame: pd.DataFrame, cycle_label: str) -> pd.DataFrame:
         if frame.empty:
             return pd.DataFrame()
@@ -344,6 +490,8 @@ class StrategyEngine:
             + signals["limit_up_count"].fillna(0).astype(int).astype(str)
             + "; 板块涨停数="
             + signals["board_limit_up_count"].fillna(0).astype(int).astype(str)
+            + "; 历史门槛="
+            + signals["gate_reason"].fillna("none").astype(str)
         )
         signals["cycle_label"] = cycle_label
         signals["metrics_json"] = signals.apply(
@@ -354,6 +502,18 @@ class StrategyEngine:
                     "board_pct_chg": row.get("board_pct_chg"),
                     "board_limit_up_count": row.get("board_limit_up_count"),
                     "best_streak": row.get("best_streak"),
+                    "target_win_rate_pct": row.get("target_win_rate_pct"),
+                    "overall_samples": row.get("overall_samples"),
+                    "overall_win_rate_pct": row.get("overall_win_rate_pct"),
+                    "overall_posterior_pct": row.get("overall_posterior_pct"),
+                    "cycle_samples": row.get("cycle_samples"),
+                    "cycle_win_rate_pct": row.get("cycle_win_rate_pct"),
+                    "cycle_posterior_pct": row.get("cycle_posterior_pct"),
+                    "band_samples": row.get("band_samples"),
+                    "band_win_rate_pct": row.get("band_win_rate_pct"),
+                    "band_posterior_pct": row.get("band_posterior_pct"),
+                    "score_band": row.get("score_band"),
+                    "gate_reason": row.get("gate_reason"),
                 },
                 ensure_ascii=False,
             ),
@@ -507,7 +667,7 @@ class StrategyEngine:
         trade_date = normalize_trade_date(trade_date) or trade_date
         emotion = self.compute_emotion_cycle(trade_date)
         cycle_label = emotion["cycle_label"]
-        strategy_map = {
+        raw_strategy_map = {
             "高位接力": self.high_relay(trade_date, cycle_label),
             "2进3": self.two_to_three(trade_date, cycle_label),
             "断板反包": self.rebound_after_break(trade_date, cycle_label),
@@ -515,6 +675,39 @@ class StrategyEngine:
             "3进4": self.three_to_four(trade_date, cycle_label),
             "打板": self.breakout_limit(trade_date, cycle_label),
         }
+        strategy_map = {
+            strategy_name: self._apply_quality_gate(trade_date, strategy_name, cycle_label, frame)
+            for strategy_name, frame in raw_strategy_map.items()
+        }
+
+        all_candidates = [(name, frame) for name, frame in strategy_map.items() if not frame.empty]
+        if all_candidates:
+            combined = []
+            for strategy_name, frame in all_candidates:
+                tmp = frame.copy()
+                tmp["strategy_name"] = strategy_name
+                combined.append(tmp)
+            combined_df = pd.concat(combined, ignore_index=True)
+            combined_df = combined_df.sort_values(
+                ["band_posterior_pct", "cycle_posterior_pct", "overall_posterior_pct", "score"],
+                ascending=False,
+            ).head(self.config.strategy_quality.max_signals_per_day)
+            selected_keys = set(zip(combined_df["strategy_name"], combined_df["code"]))
+            strategy_map = {
+                name: (
+                    frame[frame["code"].map(lambda code: (name, code) in selected_keys)].copy()
+                    if not frame.empty and "code" in frame.columns
+                    else pd.DataFrame(columns=frame.columns if hasattr(frame, "columns") else None)
+                )
+                for name, frame in strategy_map.items()
+            }
+
+        conn = self.store.connect()
+        try:
+            conn.execute("DELETE FROM strategy_signals WHERE trade_date = ?", (trade_date,))
+            conn.commit()
+        finally:
+            conn.close()
         inserted = 0
         for strategy_name, frame in strategy_map.items():
             signals = self._build_signal_rows(trade_date, strategy_name, frame, cycle_label)

@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from battle_radar.backtest import BacktestEngine
-from battle_radar.config import AppConfig
+from battle_radar.config import AppConfig, StrategyQualityConfig
 from battle_radar.database import SQLiteStore
 from battle_radar.reporter import ReportBuilder
 from battle_radar.strategy import StrategyEngine
@@ -22,6 +22,7 @@ class PipelineSmokeTestCase(unittest.TestCase):
             data_dir=root,
             reports_dir=root / "reports",
             db_path=root / "battle_radar.db",
+            strategy_quality=StrategyQualityConfig(allow_cold_start=True),
         )
         self.store = SQLiteStore(self.config.db_path)
         self.strategy = StrategyEngine(config=self.config, store=self.store)

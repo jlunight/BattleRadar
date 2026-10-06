@@ -162,7 +162,7 @@ class ReportBuilder:
             self._format_table(
                 picks,
                 ["strategy_name", "tier", "code", "name", "score", "buy_price", "stop_loss", "max_position", "reason"],
-                empty_text="暂无数据（当前交易日无满足量化规则的候选股）",
+                empty_text="暂无数据（当前交易日无同时满足量化规则与历史80%胜率门槛的候选股，建议空仓或仅观察）",
             )
         )
         lines.append("## 6. 操作时间表")
@@ -177,6 +177,7 @@ class ReportBuilder:
         lines.append("- 所有标的仅由规则引擎产生，禁止临盘情绪化加仓或切换战法。")
         lines.append("- 高位接力统一执行 +4% 止盈；若交易失败则无条件止损。")
         lines.append(f"- 当前优先级最高标的：{top_pick.get('code', '暂无')} {top_pick.get('name', '')}。")
+        lines.append("- 仅当历史样本的贝叶斯修正胜率达到 80% 目标时，系统才输出最终推荐；否则维持观望。")
         lines.append("- 报告基于 SQLite 中累计样本自动生成，历史轨迹只追加不覆盖。")
         return "\n".join(lines).strip() + "\n"
 
